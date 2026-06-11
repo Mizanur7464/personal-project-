@@ -110,7 +110,7 @@ async def build_pro_channel_post() -> str:
     signals = await build_rule_based_signals()
     summary = await get_top_coins_summary(limit=5)
     return (
-        "⭐ PRO Auto Update\n\n"
+        "⭐ PRO Update\n\n"
         "━━━ Signals ━━━\n"
         f"{signals}\n\n"
         "━━━ Market ━━━\n"
@@ -129,8 +129,9 @@ async def build_elite_ai_brief() -> Optional[str]:
     signals = await build_rule_based_signals()
 
     prompt = (
-        "You are a crypto market analyst. Write a concise Elite briefing (max 12 lines).\n"
+        "You are a crypto market analyst. Write a concise briefing (max 12 lines).\n"
         "Cover: market mood, notable movers, risk notes, 2-3 watch items.\n"
+        "No title, no heading, no 'End of Brief' line — start directly with the analysis.\n"
         "No direct buy/sell commands. No price targets. Educational tone.\n\n"
         f"Market data:\n{market}\n\nSignals:\n{signals}"
     )
@@ -152,8 +153,24 @@ async def build_elite_ai_brief() -> Optional[str]:
     for item in data.get("output") or []:
         for c in item.get("content") or []:
             if c.get("type") == "output_text" and c.get("text"):
-                return str(c["text"]).strip()
+                return _clean_elite_brief(str(c["text"]).strip())
     return None
+
+
+def _clean_elite_brief(text: str) -> str:
+    """Strip common AI headings the user does not want in channel posts."""
+    lines = text.splitlines()
+    while lines:
+        head = lines[0].strip().lower().rstrip(":")
+        if head in ("elite crypto briefing", "elite briefing", "crypto briefing"):
+            lines.pop(0)
+            continue
+        break
+    cleaned = "\n".join(lines).strip()
+    for suffix in ("—end of brief—", "-end of brief-", "end of brief"):
+        if cleaned.lower().endswith(suffix):
+            cleaned = cleaned[: -len(suffix)].rstrip(" -—")
+    return cleaned.strip()
 
 
 async def build_elite_channel_post() -> str:
@@ -161,10 +178,9 @@ async def build_elite_channel_post() -> str:
     pro_block = await build_pro_channel_post()
     ai = await build_elite_ai_brief()
     if not ai:
-        return "👑 ELITE Auto Update\n\n" + pro_block
+        return "👑 ELITE Update\n\n" + pro_block
     return (
-        "👑 ELITE Auto Update\n\n"
-        "━━━ AI Brief ━━━\n"
+        "👑 ELITE Update\n\n"
         f"{ai}\n\n"
         "━━━ Signals & Market ━━━\n"
         f"{pro_block}"
