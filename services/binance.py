@@ -177,23 +177,20 @@ async def get_top_coins_summary(limit: int = 6) -> str:
     return f"{header}{body}\n{risk_text}"
 
 
-async def get_volatility_alert(threshold_percent: float = 5.0) -> str:
-    """
-    Phase 2: List coins (from top by volume) with 24h move >= threshold %.
-    """
-    try:
-        all_tickers = await fetch_all_tickers_24h()
-    except Exception:
-        return "Could not fetch market data. Try again later."
+async def _fetch_fallback_tickers(symbols: Iterable[str]) -> List[dict]:
+    """Per-symbol 24h ticker when full-market download fails (e.g. on Railway)."""
+    out: List[dict] = []
+    for symbol in symbols:
+        try:
+            out.append(await fetch_24h_ticker(symbol))
+        except Exception:
+            continue
+    return out
 
-    usdt = [t for t in all_tickers if t["symbol"].endswith("USDT")]
-    for t in usdt:
-        t["_quoteVolume"] = float(t.get("quoteVolume", 0))
-    usdt.sort(key=lambda t: t["_quoteVolume"], reverse=True)
-    top = usdt[:20]
 
+def _format_volatility_alert(tickers: List[dict], threshold_percent: float) -> str:
     alert_lines: List[str] = []
-    for t in top:
+    for t in tickers:
         pct = float(t["priceChangePercent"])
         if abs(pct) >= threshold_percent:
             emoji = "📈" if pct >= 0 else "📉"
@@ -213,4 +210,24 @@ async def get_volatility_alert(threshold_percent: float = 5.0) -> str:
     body = "\n".join(alert_lines)
     footer = "\n\n⚠️ High volatility = higher risk. Use stop loss and position sizing."
     return f"{header}{body}{footer}"
+
+
+async def get_volatility_alert(threshold_percent: float = 5.0) -> str:
+    """
+    Phase 2: List coins (from top by volume) with 24h move >= threshold %.
+    """
+    try:
+        all_tickers = await fetch_all_tickers_24h()
+        usdt = [t for t in all_tickers if t["symbol"].endswith("USDT")]
+        for t in usdt:
+            t["_quoteVolume"] = float(t.get("quoteVolume", 0))
+        usdt.sort(key=lambda t: t["_quoteVolume"], reverse=True)
+        top = usdt[:20]
+        return _format_volatility_alert(top, threshold_percent)
+    except Exception:
+        fallback = await _fetch_fallback_tickers(TOP_COINS_FALLBACK)
+        if not fallback:
+            return "Could not fetch market data. Try again later."
+        note = "ℹ️ Using major coins (full market list unavailable).\n\n"
+        return note + _format_volatility_alert(fallback, threshold_percent)
 
