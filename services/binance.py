@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import os
 import time
 import httpx
@@ -11,10 +12,10 @@ _TICKER_CACHE_TTL_SEC = 45.0
 
 # Official mirrors (if api.binance.com is slow/blocked, next may work)
 _DEFAULT_BINANCE_BASES = [
-    "https://api.binance.com",
     "https://api1.binance.com",
     "https://api2.binance.com",
     "https://api3.binance.com",
+    "https://api.binance.com",
 ]
 
 BINANCE_BASE_URL = "https://api.binance.com"  # legacy name; real calls use mirrors below
@@ -60,6 +61,11 @@ async def binance_get_json(path: str, params: Optional[Dict[str, Any]] = None) -
 # Phase 2: fallback list if top-by-volume fetch fails
 TOP_COINS_FALLBACK: List[str] = [
     "BTCUSDT", "ETHUSDT", "BNBUSDT", "SOLUSDT", "XRPUSDT", "ADAUSDT",
+]
+
+MAJOR_COINS_USDT: List[str] = TOP_COINS_FALLBACK + [
+    "DOGEUSDT", "AVAXUSDT", "DOTUSDT", "LINKUSDT", "LTCUSDT", "TRXUSDT",
+    "UNIUSDT", "ATOMUSDT", "APTUSDT", "ARBUSDT",
 ]
 
 
@@ -144,7 +150,13 @@ async def get_top_coins_summary(limit: int = 6) -> str:
     try:
         all_tickers = await fetch_all_tickers_24h()
     except Exception:
-        return await get_simple_market_summary(TOP_COINS_FALLBACK[:limit])
+        tickers = await _fetch_tickers_parallel(TOP_COINS_FALLBACK[:limit])
+        if tickers:
+            return await get_simple_market_summary([t["symbol"] for t in tickers])
+        try:
+            return await _coingecko_top_summary(limit)
+        except Exception:
+            return "Could not fetch market data. Try again later."
 
     usdt = [t for t in all_tickers if t["symbol"].endswith("USDT")]
     for t in usdt:
@@ -177,15 +189,89 @@ async def get_top_coins_summary(limit: int = 6) -> str:
     return f"{header}{body}\n{risk_text}"
 
 
-async def _fetch_fallback_tickers(symbols: Iterable[str]) -> List[dict]:
-    """Per-symbol 24h ticker when full-market download fails (e.g. on Railway)."""
-    out: List[dict] = []
-    for symbol in symbols:
+async def _fetch_tickers_parallel(symbols: Iterable[str]) -> List[dict]:
+    """Fetch multiple Binance 24h tickers in parallel."""
+
+    async def _one(symbol: str) -> Optional[dict]:
         try:
-            out.append(await fetch_24h_ticker(symbol))
+            return await fetch_24h_ticker(symbol)
         except Exception:
+            return None
+
+    results = await asyncio.gather(*(_one(s) for s in symbols))
+    return [r for r in results if r is not None]
+
+
+async def _coingecko_markets(per_page: int = 20) -> List[dict]:
+    """Top coins by market cap from CoinGecko (works when Binance is blocked)."""
+    async with httpx.AsyncClient(timeout=httpx.Timeout(30.0)) as client:
+        response = await client.get(
+            "https://api.coingecko.com/api/v3/coins/markets",
+            params={
+                "vs_currency": "usd",
+                "order": "market_cap_desc",
+                "per_page": per_page,
+                "page": 1,
+                "sparkline": "false",
+                "price_change_percentage": "24h",
+            },
+        )
+        response.raise_for_status()
+        return response.json()
+
+
+def _coingecko_volatility_alert(coins: List[dict], threshold_percent: float) -> str:
+    alert_lines: List[str] = []
+    for coin in coins:
+        pct = coin.get("price_change_percentage_24h")
+        if pct is None:
             continue
-    return out
+        pct = float(pct)
+        if abs(pct) >= threshold_percent:
+            emoji = "📈" if pct >= 0 else "📉"
+            sym = str(coin.get("symbol", "?")).upper()
+            alert_lines.append(f"{emoji} {sym}USDT: {_format_number(pct, 2)}% (24h)")
+
+    if not alert_lines:
+        return (
+            f"🔔 Volatility Alert (24h move ≥ {threshold_percent}%)\n\n"
+            f"No top coins moved ≥{threshold_percent}% in the last 24h. "
+            f"Market is relatively calm."
+        )
+
+    header = (
+        f"🔔 Volatility Alert — 24h move ≥ {threshold_percent}%\n"
+        "(Top coins by market cap)\n\n"
+    )
+    body = "\n".join(alert_lines)
+    footer = "\n\n⚠️ High volatility = higher risk. Use stop loss and position sizing."
+    return f"{header}{body}{footer}"
+
+
+async def _coingecko_top_summary(limit: int) -> str:
+    coins = await _coingecko_markets(per_page=max(limit, 6))
+    results: List[str] = []
+    for coin in coins[:limit]:
+        pct = float(coin.get("price_change_percentage_24h") or 0)
+        price = float(coin.get("current_price") or 0)
+        high = float(coin.get("high_24h") or price)
+        low = float(coin.get("low_24h") or price)
+        sym = str(coin.get("symbol", "?")).upper() + "USDT"
+        direction_emoji = "📈" if pct >= 0 else "📉"
+        results.append(
+            f"{direction_emoji} {sym}\n"
+            f"  Price: {_format_number(price, 2)}\n"
+            f"  24h Change: {_format_number(pct, 2)}%\n"
+            f"  24h High/Low: {_format_number(high, 2)} / {_format_number(low, 2)}\n"
+        )
+
+    header = "📊 Top Coins Summary (CoinGecko)\n\n"
+    risk_text = (
+        "⚠️ Risk Reminder: Crypto markets are highly volatile. "
+        "Always use proper risk management and only trade with money "
+        "you can afford to lose."
+    )
+    return f"{header}" + "\n".join(results) + f"\n{risk_text}"
 
 
 def _format_volatility_alert(tickers: List[dict], threshold_percent: float) -> str:
@@ -214,20 +300,30 @@ def _format_volatility_alert(tickers: List[dict], threshold_percent: float) -> s
 
 async def get_volatility_alert(threshold_percent: float = 5.0) -> str:
     """
-    Phase 2: List coins (from top by volume) with 24h move >= threshold %.
+    Phase 2: List coins with 24h move >= threshold %.
+    Tries Binance (parallel major coins) then CoinGecko if Binance is blocked.
     """
+    tickers = await _fetch_tickers_parallel(MAJOR_COINS_USDT)
+    if tickers:
+        return _format_volatility_alert(tickers, threshold_percent)
+
+    try:
+        cg = await _coingecko_markets(20)
+        if cg:
+            note = "ℹ️ Data via CoinGecko (Binance unavailable).\n\n"
+            return note + _coingecko_volatility_alert(cg, threshold_percent)
+    except Exception as e:
+        print(f"[COINGECKO] volatility fallback failed: {type(e).__name__}: {e}", flush=True)
+
     try:
         all_tickers = await fetch_all_tickers_24h()
         usdt = [t for t in all_tickers if t["symbol"].endswith("USDT")]
         for t in usdt:
             t["_quoteVolume"] = float(t.get("quoteVolume", 0))
         usdt.sort(key=lambda t: t["_quoteVolume"], reverse=True)
-        top = usdt[:20]
-        return _format_volatility_alert(top, threshold_percent)
+        return _format_volatility_alert(usdt[:20], threshold_percent)
     except Exception:
-        fallback = await _fetch_fallback_tickers(TOP_COINS_FALLBACK)
-        if not fallback:
-            return "Could not fetch market data. Try again later."
-        note = "ℹ️ Using major coins (full market list unavailable).\n\n"
-        return note + _format_volatility_alert(fallback, threshold_percent)
+        pass
+
+    return "Could not fetch market data. Try again later."
 
