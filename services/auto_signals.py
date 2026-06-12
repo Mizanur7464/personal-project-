@@ -105,10 +105,7 @@ async def build_free_market_update(mode: str) -> str:
     return await get_top_coins_summary(limit=8)
 
 
-async def build_pro_channel_post() -> str:
-    """Pro channel: rule signals + compact top-coin snapshot."""
-    signals = await build_rule_based_signals()
-    summary = await get_top_coins_summary(limit=5)
+def _format_pro_block(signals: str, summary: str) -> str:
     return (
         "⭐ PRO Update\n\n"
         "━━━ Signals ━━━\n"
@@ -118,15 +115,30 @@ async def build_pro_channel_post() -> str:
     )
 
 
-async def build_elite_ai_brief() -> Optional[str]:
+async def build_pro_channel_post(
+    *,
+    signals: Optional[str] = None,
+    summary: Optional[str] = None,
+) -> str:
+    """Pro channel: rule signals + compact top-coin snapshot."""
+    if signals is None:
+        signals = await build_rule_based_signals()
+    if summary is None:
+        summary = await get_top_coins_summary(limit=5)
+    return _format_pro_block(signals, summary)
+
+
+async def build_elite_ai_brief(
+    *,
+    market: str,
+    signals: str,
+) -> Optional[str]:
     """Short AI market brief for Elite channel."""
     if not ai_enabled():
         return None
 
     api_key = os.getenv("OPENAI_API_KEY", "").strip()
     model = os.getenv("OPENAI_MODEL", "gpt-4.1-mini").strip()
-    market = await get_top_coins_summary(limit=6)
-    signals = await build_rule_based_signals()
 
     prompt = (
         "You are a crypto market analyst. Write a concise briefing (max 12 lines).\n"
@@ -174,9 +186,12 @@ def _clean_elite_brief(text: str) -> str:
 
 
 async def build_elite_channel_post() -> str:
-    """Elite channel: Pro content + optional AI brief."""
-    pro_block = await build_pro_channel_post()
-    ai = await build_elite_ai_brief()
+    """Elite channel: Pro content + optional AI brief (one market fetch, cached)."""
+    signals = await build_rule_based_signals()
+    summary = await get_top_coins_summary(limit=6)
+    pro_summary = await get_top_coins_summary(limit=5)
+    pro_block = _format_pro_block(signals, pro_summary)
+    ai = await build_elite_ai_brief(market=summary, signals=signals)
     if not ai:
         return "👑 ELITE Update\n\n" + pro_block
     return (
